@@ -131,12 +131,37 @@ export function checkAppAsar(file, config, version) {
   } finally { asar.close(); }
 }
 
-// app-update.yml (written by electron-builder beside app.asar) must name this release repository.
+// app-update.yml as electron-builder writes it is flat `key: value` lines. Parsed strictly: any line that is not a
+// plain scalar pair, an empty value, or a repeated key (even with the same value) is rejected, so the first match can
+// never hide a conflicting second one.
+export function parseAppUpdateYml(text) {
+  const out = new Map();
+  for (const raw of text.replace(/\r\n/g, '\n').split('\n')) {
+    if (raw.trim() === '') continue;
+    const m = /^([A-Za-z][A-Za-z0-9]*): ?(.*?)\s*$/.exec(raw);
+    if (!m) fail('identity-malformed', `app-update.yml has a line that is not a plain "key: value" pair: ${JSON.stringify(raw.slice(0, 60))}`);
+    let value = m[2];
+    const quoted = /^(["'])(.*)\1$/.exec(value);
+    if (quoted) value = quoted[2];
+    if (value === '' || /["'#]/.test(value) || /\s/.test(value)) fail('identity-malformed', `app-update.yml ${m[1]} has a missing or malformed value`);
+    if (out.has(m[1])) fail('identity-malformed', `app-update.yml repeats the key ${m[1]}`);
+    out.set(m[1], value);
+  }
+  return out;
+}
+
+// app-update.yml (written by electron-builder beside app.asar) must name this release repository, each of provider,
+// owner and repo exactly once.
+export function checkAppUpdateText(text, config) {
+  const yml = parseAppUpdateYml(text);
+  for (const k of ['provider', 'owner', 'repo']) if (!yml.has(k)) fail('identity-missing', `app-update.yml has no ${k}`);
+  if (yml.get('provider') !== 'github' || `${yml.get('owner')}/${yml.get('repo')}` !== config.repo) fail('identity-mismatch', `packaged app-update.yml points at ${yml.get('provider')}:${yml.get('owner')}/${yml.get('repo')}, expected github:${config.repo}`);
+}
+
 function checkAppUpdateYml(file, config) {
   let text;
   try { text = fs.readFileSync(file, 'utf8'); } catch (e) { fail('identity-missing', `resources/app-update.yml is missing from the installer: ${e.code}`); }
-  const top = k => { const m = new RegExp(`^${k}:\\s*(\\S+)\\s*$`, 'm').exec(text); return m && m[1].replace(/^['"]|['"]$/g, ''); };
-  if (top('provider') !== 'github' || `${top('owner')}/${top('repo')}` !== config.repo) fail('identity-mismatch', `packaged app-update.yml points at ${top('owner')}/${top('repo')}, expected ${config.repo}`);
+  checkAppUpdateText(text, config);
 }
 
 // Inspects one installer file. `expectedSha512` binds the decision to the exact bytes whose hashes were verified.

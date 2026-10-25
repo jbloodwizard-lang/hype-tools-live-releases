@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { validateConfig, ReleaseError } from './lib.mjs';
-import { inspectInstaller, expectedPackageName, parseSltListing, FIXTURE_FILE, CHANNEL_FILE, APP_PAYLOAD } from './installer-inspection.mjs';
+import { inspectInstaller, expectedPackageName, parseSltListing, parseAppUpdateYml, checkAppUpdateText, FIXTURE_FILE, CHANNEL_FILE, APP_PAYLOAD } from './installer-inspection.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..', '..');
@@ -180,6 +180,47 @@ test('a missing inspection tool or a changed file fails closed', () => {
   assert.equal(code(() => inspect(file, beta, '1.2.3', { expectedSha512: crypto.createHash('sha512').update('other').digest('base64') })), 'installer-changed');
   assert.equal(code(() => inspect(file, beta, '1.2')), 'inspect-usage');
   assert.equal(code(() => expectedPackageName({ ...beta, installerTemplate: 'setup-{version}.msi' })), 'inspect-config');
+});
+
+// Verbatim app-update.yml written by electron-builder 26.18.0 for the BETA build (key order as generated).
+const REAL_YML = (repo = beta.repo) => `owner: ${repo.split('/')[0]}\nrepo: ${repo.split('/')[1]}\nprovider: github\nreleaseType: release\nupdaterCacheDirName: hype-tools-beta-updater\n`;
+
+test('app-update.yml: the real electron-builder format is accepted for BETA and LIVE', () => {
+  checkAppUpdateText(REAL_YML(), beta);
+  checkAppUpdateText(REAL_YML(live.repo), live);
+  checkAppUpdateText(REAL_YML().replace(/\n/g, '\r\n'), beta);
+  checkAppUpdateText(`provider: 'github'\nowner: "jbloodwizard-lang"\nrepo: hype-tools-beta-releases\n`, beta);
+  assert.equal(parseAppUpdateYml(REAL_YML()).get('updaterCacheDirName'), 'hype-tools-beta-updater');
+});
+
+test('app-update.yml: duplicate provider, owner or repo keys are rejected, whatever their order or value', () => {
+  const dup = {
+    'repo then conflicting repo': REAL_YML() + `repo: ${live.repo.split('/')[1]}\n`,
+    'conflicting repo then repo': `repo: ${live.repo.split('/')[1]}\n` + REAL_YML(),
+    'repo repeated with the same value': REAL_YML() + 'repo: hype-tools-beta-releases\n',
+    'owner then conflicting owner': REAL_YML() + 'owner: someone-else\n',
+    'provider then conflicting provider': REAL_YML() + 'provider: generic\n',
+    'provider repeated with the same value': REAL_YML() + 'provider: github\n',
+    'duplicate of another key': REAL_YML() + 'releaseType: draft\n',
+    'duplicate with CRLF': (REAL_YML() + 'repo: other\n').replace(/\n/g, '\r\n'),
+  };
+  for (const [name, text] of Object.entries(dup)) assert.equal(code(() => checkAppUpdateText(text, beta)), 'identity-malformed', name);
+});
+
+test('app-update.yml: missing, empty, malformed or wrong-identity metadata is rejected', () => {
+  const miss = k => REAL_YML().split('\n').filter(l => !l.startsWith(k + ':')).join('\n');
+  for (const k of ['provider', 'owner', 'repo']) assert.equal(code(() => checkAppUpdateText(miss(k), beta)), 'identity-missing', k);
+  assert.equal(code(() => checkAppUpdateText('', beta)), 'identity-missing');
+  for (const text of [REAL_YML().replace('repo: hype-tools-beta-releases', 'repo:'), REAL_YML().replace('provider: github', 'provider: "github'), REAL_YML().replace('provider: github', 'provider: git hub'), REAL_YML() + 'not a pair\n', REAL_YML() + '  indented: x\n', REAL_YML() + '- item\n', REAL_YML() + 'repo: a #b\n']) assert.equal(code(() => checkAppUpdateText(text, beta)), 'identity-malformed', JSON.stringify(text.slice(-30)));
+  assert.equal(code(() => checkAppUpdateText(REAL_YML(live.repo), beta)), 'identity-mismatch');
+  assert.equal(code(() => checkAppUpdateText(REAL_YML().replace('provider: github', 'provider: generic'), beta)), 'identity-mismatch');
+  assert.equal(code(() => checkAppUpdateText(REAL_YML().replace('owner: jbloodwizard-lang', 'owner: x'), beta)), 'identity-mismatch');
+});
+
+test('a real installer layout with a duplicate repo key in app-update.yml is rejected end to end', () => {
+  assert.ok(inspect(makeInstaller('beta', '1.2.3', { yml: REAL_YML() }), beta, '1.2.3'));
+  assert.equal(code(() => inspect(makeInstaller('beta', '1.2.3', { yml: REAL_YML() + `repo: ${live.repo.split('/')[1]}\n` }), beta, '1.2.3')), 'identity-malformed');
+  assert.equal(code(() => inspect(makeInstaller('beta', '1.2.3', { yml: REAL_YML() + 'provider: generic\n' }), beta, '1.2.3')), 'identity-malformed');
 });
 
 test('7z listings are parsed strictly', () => {
