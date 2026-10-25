@@ -268,3 +268,90 @@ test('verifyPublication: public bytes are compared with the verified draft even 
   assert.deepEqual(r.problems, ['digest-mismatch: latest.yml: public sha256 differs from the verified draft']);
   assert.equal(r.digests, 0);
 });
+
+// ---- review fixes: recovery outcome from read-back; bounded retries for public reads ----
+test('recoverLatest: a command error after GitHub applied the change is judged by the read-back (restored / withdrawn)', async () => {
+  const prev = { tag: 'v1.1.0', version: '1.1.0', sequence: 4 };
+  const x = world();
+  x.w.io.setLatest = async t => { x.w.latest = t; throw new Error('HTTP 502 after the change'); };
+  const r = await recoverLatest({ io: x.w.io, config: live, tag: x.tag, previous: prev });
+  assert.equal(r.outcome, 'restored');
+  assert.match(r.steps.join(' '), /reported an error: HTTP 502 after the change/);
+  assert.match(r.detail, /read-back confirms/);
+  const text = incidentReport({ repo: 'o/live', tag: x.tag, published: null, problems: ['size-mismatch: x'], recovery: r, previous: prev, latestBefore: 'v1.1.0', ledgerError: null }).join('\n');
+  assert.match(text, /RECOVERY STEP: the command to make v1\.1\.0 latest reported an error: HTTP 502/);
+  assert.match(text, /RESTORED:/);
+  assert.doesNotMatch(text, /MANUAL INTERVENTION REQUIRED/);
+
+  const y = world({ previous: null });
+  y.w.io.setPrerelease = async t => { y.releases[t].prerelease = true; y.w.latest = null; throw new Error('HTTP 502 after the change'); };
+  const w = await recoverLatest({ io: y.w.io, config: live, tag: y.tag, previous: null });
+  assert.equal(w.outcome, 'withdrawn');
+  assert.match(w.steps.join(' '), /reported an error: HTTP 502 after the change/);
+  assert.doesNotMatch(incidentReport({ repo: 'o/live', tag: y.tag, published: null, problems: ['x: y'], recovery: w, previous: null, latestBefore: null, ledgerError: null }).join('\n'), /MANUAL INTERVENTION REQUIRED/);
+});
+test('recoverLatest: a command error whose read-back disagrees, or an invalid target, still fails and asks for a person', async () => {
+  const prev = { tag: 'v1.1.0', version: '1.1.0', sequence: 4 };
+  const x = world(); x.w.io.setLatest = async () => { throw new Error('HTTP 422'); };
+  const r = await recoverLatest({ io: x.w.io, config: live, tag: x.tag, previous: prev });
+  assert.equal(r.outcome, 'restore-failed');
+  assert.match(incidentReport({ repo: 'o/live', tag: x.tag, published: null, problems: ['x: y'], recovery: r, previous: prev, latestBefore: null, ledgerError: null }).join('\n'), /MANUAL INTERVENTION REQUIRED: set the latest release to v1\.1\.0/);
+  const y = world(); y.w.io.setLatest = async t => { y.w.latest = t; throw new Error('HTTP 502'); };
+  y.releases['v1.1.0'].assets.pop();
+  assert.equal((await recoverLatest({ io: y.w.io, config: live, tag: y.tag, previous: prev })).outcome, 'restore-failed', 'state moved, but the target fails validation');
+  const z = world(); z.w.io.setLatest = async t => { z.w.latest = t; throw new Error('HTTP 502'); };
+  const reads = z.w.io.getLatest; let n = 0; z.w.io.getLatest = async () => { if (n++ >= 0) throw new Error('HTTP 503'); return reads(); };
+  assert.equal((await recoverLatest({ io: z.w.io, config: live, tag: z.tag, previous: prev })).outcome, 'restore-failed', 'no read-back, no success');
+});
+
+// Wraps world().io.download so that the first `n` requests for `name` answer with `fault` (a status or 'throw').
+function flaky(x, name, n, fault) {
+  const real = x.w.io.download, calls = {};
+  x.w.io.download = async url => {
+    const k = decodeURIComponent(url.split('/').pop());
+    calls[k] = (calls[k] || 0) + 1;
+    if (k === name && calls[k] <= n) { if (fault === 'throw') throw new TypeError('fetch failed: ECONNRESET'); return { ok: false, status: fault }; }
+    return real(url);
+  };
+  return calls;
+}
+test('verifyPublication: transient public download failures (404 just after publication, 429, 5xx, network) that clear pass', async () => {
+  for (const fault of [404, 408, 425, 429, 500, 503, 'throw']) {
+    const x = world();
+    const calls = flaky(x, 'latest.yml', 3, fault);
+    assert.deepEqual((await verifyPublication(x.args)).problems, [], String(fault));
+    assert.equal(calls['latest.yml'], 4);
+  }
+});
+test('verifyPublication: persistent or non-transient public download failures still fail', async () => {
+  let x = world(); let calls = flaky(x, 'latest.yml', 99, 404);
+  assert.deepEqual((await verifyPublication(x.args)).problems, ['download-failed: latest.yml: HTTP 404 (after 4 attempts)']);
+  assert.equal(calls['latest.yml'], 4);
+  x = world(); flaky(x, exp.installer, 99, 'throw');
+  assert.ok((await verifyPublication(x.args)).problems.some(p => /^download-failed: P-LIVE-Setup-1\.2\.0\.exe: .*ECONNRESET \(after 4 attempts\)$/.test(p)));
+  x = world(); calls = flaky(x, 'latest.yml', 99, 403);
+  assert.deepEqual((await verifyPublication(x.args)).problems, ['download-failed: latest.yml: HTTP 403']);
+  assert.equal(calls['latest.yml'], 1, '403 is not retried');
+});
+test('verifyPublication: retries never turn an integrity mismatch into a pass', async () => {
+  const x = world();
+  const calls = flaky(x, 'release-statement.json', 2, 503);
+  const env = JSON.parse(x.w.served['release-statement.json'].toString());
+  x.w.served['release-statement.json'] = Buffer.from(JSON.stringify({ ...env, signature: Buffer.alloc(64).toString('base64') }));
+  const codes = (await verifyPublication(x.args)).problems.map(p => p.split(':')[0]);
+  assert.ok(codes.includes('digest-mismatch') && codes.includes('installer-mismatch'), String(codes));
+  assert.equal(calls['release-statement.json'], 3, 'retried only until a response arrived, then checked once');
+});
+test('verifyPublication: a briefly stale or unreachable releases.atom passes once it catches up; a persistently stale one fails', async () => {
+  let x = world(); let n = 0;
+  x.w.io.atomFirstTag = async () => { n++; if (n === 1) throw new Error('releases.atom HTTP 502'); return n < 3 ? 'v1.1.0' : x.tag; };
+  assert.deepEqual((await verifyPublication(x.args)).problems, []);
+  assert.equal(n, 3);
+  x = world(); n = 0;
+  x.w.io.atomFirstTag = async () => { n++; return 'v1.1.0'; };
+  assert.deepEqual((await verifyPublication(x.args)).problems, ['atom-feed: releases.atom first entry is v1.1.0, expected v1.2.0 (after 4 attempts)']);
+  assert.equal(n, 4);
+  x = world();
+  x.w.io.atomFirstTag = async () => { throw new Error('releases.atom HTTP 500'); };
+  assert.deepEqual((await verifyPublication(x.args)).problems, ['atom-read: releases.atom HTTP 500 (after 4 attempts)']);
+});

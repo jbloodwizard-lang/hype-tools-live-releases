@@ -234,6 +234,24 @@ export function redact(text, max = MAX_CHECK_TEXT) {
 const errText = e => redact(e && e.code ? `${e.code}: ${e.message}` : (e && (e.stderr || e.message)) || e, 200);
 const assetKey = a => ({ id: a.id, name: a.name, size: a.size });
 
+// Public-read retry policy: up to `attempts` tries (default 4) with waits of delayMs, 2*delayMs, 3*delayMs between them
+// (default 3 s, so at most 18 s per URL). Retried: thrown network errors and HTTP 404 (assets can lag just after
+// publication), 408, 425, 429 and 5xx. Any other status fails at once.
+export const TRANSIENT_HTTP = status => [404, 408, 425, 429].includes(status) || (status >= 500 && status <= 599);
+// `judge(result)` returns { value } for a final good answer, or { retry, error, value } otherwise. The answer of the
+// last try is returned as is: { value, error, thrown, tries }.
+async function publicRead(io, read, judge, attempts, delayMs) {
+  let last = { error: 'not attempted', tries: 0 };
+  for (let i = 0; i < attempts; i++) {
+    let j;
+    try { j = judge(await read()); last = { value: j.value, error: j.error || null, thrown: false, tries: i + 1 }; }
+    catch (e) { j = { retry: true }; last = { error: errText(e), thrown: true, tries: i + 1 }; }
+    if (!j.retry || i === attempts - 1) break;
+    await io.sleep(delayMs * (i + 1));
+  }
+  return last;
+}
+
 // `v` is the verified draft returned by verifyDraft: snapshot, expected per-asset size and sha256, installer facts,
 // statement sequence floor and public key. Collects every problem (not only the first) as "code: detail" strings.
 // The release and `latest` reads are retried a few times so that a briefly stale API answer is not reported as a failure.
@@ -269,13 +287,19 @@ export async function verifyPublication({ io, config, repo, tag, version, v, att
   const names = [v.exp.installer, v.exp.metadata, v.exp.statement];
 
   // Each asset from its public URL, exactly as a client fetches it, against the verified draft and GitHub's digest.
+  // Only the fetch itself is retried (see publicRead); a response that arrives is checked once, so a retry can never
+  // turn a size or hash mismatch into a pass.
   const got = {};
   let digests = 0;
   for (const n of names) {
-    let d;
-    try { d = await io.download(`https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(n)}`); }
-    catch (e) { add('download-failed', `${n}: ${errText(e)}`); continue; }
-    if (!d || !d.ok) { add('download-failed', `${n}: HTTP ${d ? d.status : 'no response'}`); continue; }
+    const url = `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(n)}`;
+    const r = await publicRead(io, () => io.download(url), d => {
+      if (!d) return { retry: true, error: 'no response' };
+      if (d.ok) return { value: d };
+      return { retry: TRANSIENT_HTTP(d.status), error: `HTTP ${d.status}` };
+    }, attempts, delayMs);
+    if (r.error) { add('download-failed', `${n}: ${r.error}${r.tries > 1 ? ` (after ${r.tries} attempts)` : ''}`); continue; }
+    const d = r.value;
     got[n] = d;
     const want = v.expected[n];
     if (d.size !== want.size) add('size-mismatch', `${n}: public download is ${d.size} bytes, verified draft ${want.size}`);
@@ -301,22 +325,24 @@ export async function verifyPublication({ io, config, repo, tag, version, v, att
       try { check(f.body.toString('utf8')); } catch (e) { add('installer-mismatch', `${n}: ${errText(e)}`); }
     }
   }
-  try {
-    const first = await io.atomFirstTag();
-    if (first !== tag) add('atom-feed', `releases.atom first entry is ${first}, expected ${tag}`);
-  } catch (e) { add('atom-read', errText(e)); }
+  // The feed can lag behind the release API: a read error or a stale first entry is re-read; the last answer counts.
+  const feed = await publicRead(io, () => io.atomFirstTag(), f => (f === tag ? { value: f } : { retry: true, value: f }), attempts, delayMs);
+  const after = feed.tries > 1 ? ` (after ${feed.tries} attempts)` : '';
+  if (feed.thrown) add('atom-read', feed.error + after);
+  else if (feed.value !== tag) add('atom-feed', `releases.atom first entry is ${feed.value}, expected ${tag}${after}`);
   return { problems: problems.map(p => redact(p)), digests, published: pub && { url: pub.html_url || null, publishedAt: pub.published_at || null } };
 }
 
 // After a failed verification: point `latest` back at the previous known-good release and read it back. With no such
 // release, take the failed release out of /releases/latest by marking it a prerelease (immutable releases keep that flag
-// editable) and read that back. Neither action hides, deletes or edits the failed release or its assets.
+// editable) and read that back. The outcome comes from the read-back, never from the command's exit status alone.
+// Neither action hides, deletes or edits the failed release or its assets.
 export async function recoverLatest({ io, config, tag, previous }) {
   const steps = [], checks = [];
   if (previous) {
     let setError = null;
     try { await io.setLatest(previous.tag); steps.push(`asked GitHub to make ${previous.tag} the latest release`); }
-    catch (e) { setError = errText(e); steps.push(`making ${previous.tag} latest FAILED: ${setError}`); }
+    catch (e) { setError = errText(e); steps.push(`the command to make ${previous.tag} latest reported an error: ${setError}`); }
     try {
       const latest = await io.getLatest();
       if (!latest || latest.tag_name !== previous.tag) checks.push(`/releases/latest is ${latest ? latest.tag_name : 'missing'}, expected ${previous.tag}`);
@@ -332,13 +358,14 @@ export async function recoverLatest({ io, config, tag, previous }) {
         for (const n of [want.installer, want.metadata, want.statement]) if (!have.has(n)) checks.push(`${previous.tag} lacks ${n}`);
       }
     } catch (e) { checks.push(`could not read ${previous.tag}: ${errText(e)}`); }
-    if (setError) return { outcome: 'restore-failed', target: previous.tag, detail: setError, steps, checks };
-    if (checks.length) return { outcome: 'restore-unverified', target: previous.tag, detail: checks.join('; '), steps, checks };
-    return { outcome: 'restored', target: previous.tag, detail: `${previous.tag} read back as the latest release`, steps, checks };
+    // The read-back decides: a command error with a confirmed state is still restored (the error stays in `steps`).
+    if (!checks.length) return { outcome: 'restored', target: previous.tag, detail: `${previous.tag} read back as the latest release${setError ? ' (the command reported an error, but the read-back confirms the change)' : ''}`, steps, checks };
+    if (setError) return { outcome: 'restore-failed', target: previous.tag, detail: `${setError}; ${checks.join('; ')}`, steps, checks };
+    return { outcome: 'restore-unverified', target: previous.tag, detail: checks.join('; '), steps, checks };
   }
   let setError = null;
   try { await io.setPrerelease(tag); steps.push(`no previous known-good release; asked GitHub to mark ${tag} as a prerelease`); }
-  catch (e) { setError = errText(e); steps.push(`marking ${tag} as a prerelease FAILED: ${setError}`); }
+  catch (e) { setError = errText(e); steps.push(`no previous known-good release; the command to mark ${tag} as a prerelease reported an error: ${setError}`); }
   try {
     const latest = await io.getLatest();
     if (latest) checks.push(`/releases/latest is ${latest.tag_name}, expected no latest release${latest.tag_name === tag ? '' : ' (that release is not a known-good release)'}`);
@@ -347,9 +374,9 @@ export async function recoverLatest({ io, config, tag, previous }) {
     const rel = await io.getRelease(tag);
     if (!rel || rel.prerelease !== true) checks.push(`${tag} prerelease flag reads back as ${rel && rel.prerelease}`);
   } catch (e) { checks.push(`could not read ${tag}: ${errText(e)}`); }
-  if (setError) return { outcome: 'withdraw-failed', target: null, detail: setError, steps, checks };
-  if (checks.length) return { outcome: 'withdraw-unverified', target: null, detail: checks.join('; '), steps, checks };
-  return { outcome: 'withdrawn', target: null, detail: `${tag} is a prerelease and GitHub reports no latest release`, steps, checks };
+  if (!checks.length) return { outcome: 'withdrawn', target: null, detail: `${tag} is a prerelease and GitHub reports no latest release${setError ? ' (the command reported an error, but the read-back confirms the change)' : ''}`, steps, checks };
+  if (setError) return { outcome: 'withdraw-failed', target: null, detail: `${setError}; ${checks.join('; ')}`, steps, checks };
+  return { outcome: 'withdraw-unverified', target: null, detail: checks.join('; '), steps, checks };
 }
 
 // The ledger entry for a release whose post-publication verification failed. Small, fixed shape, no secrets.

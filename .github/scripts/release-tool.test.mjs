@@ -367,6 +367,50 @@ test('S21 published releases missing from the ledger block verification', () => 
   failed(run(publish, { ...h, ledger: h.ledger.slice(0, 1) }), 'unrecorded-release');
 });
 
+test('S23 restore command errors after GitHub applied it: the read-back decides, outcome restored, error kept', () => {
+  const r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 404 }, setLatestErrorAfter: true } });
+  failed(r, 'post-publish-check');
+  const e = r.ledger.find(x => x.tag === 'v1.2.0');
+  assert.equal(e.status, 'failed-verification');
+  assert.equal(e.failure.recovery, 'restored');
+  assert.equal(latest(r), 'v1.1.0');
+  assert.match(r.text, /RECOVERY STEP: the command to make v1\.1\.0 latest reported an error: gh: HTTP 502/);
+  assert.match(r.text, /RESTORED: \/releases\/latest read back as v1\.1\.0/);
+  assert.doesNotMatch(r.text, /MANUAL INTERVENTION REQUIRED/);
+});
+
+test('S24 withdrawal command errors after GitHub applied it: outcome withdrawn, error kept, no manual step demanded', () => {
+  const r = run(publish, { ledger: [], releases: [release('1.2.0', { seq: 5 })], faults: { publicStatus: { 'latest.yml': 404 }, setPrereleaseErrorAfter: true } });
+  failed(r, 'post-publish-check');
+  assert.equal(r.ledger.find(x => x.tag === 'v1.2.0').failure.recovery, 'withdrawn');
+  assert.equal(rel(r, 'v1.2.0').prerelease, true);
+  assert.equal(latest(r), null);
+  assert.match(r.text, /RECOVERY STEP: no previous known-good release; the command to mark v1\.2\.0 as a prerelease reported an error: gh: HTTP 502/);
+  assert.doesNotMatch(r.text, /MANUAL INTERVENTION REQUIRED/);
+});
+
+test('S25 transient public download failures that clear within the retry window pass; ones that persist fail', () => {
+  const inst = config.installerTemplate.replace('{version}', '1.2.0');
+  let r = run(publish, { ...history(), faults: { publicTransient: { [inst]: 2, 'latest.yml': 3 }, publicTransientThrow: { 'release-statement.json': 1 } } });
+  ok(r);
+  assert.equal(r.ledger.find(x => x.tag === 'v1.2.0').status, 'published');
+  r = run(publish, { ...history(), faults: { publicTransient: { 'latest.yml': 4 } } });
+  failed(r, 'post-publish-check');
+  assert.match(r.text, /download-failed: latest\.yml: HTTP 503 \(after 4 attempts\)/);
+  r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 403 } } });
+  failed(r, 'post-publish-check');
+  assert.match(r.text, /^FAILED CHECKS \(1\): download-failed: latest\.yml: HTTP 403$/m, 'a non-transient status is not retried');
+});
+
+test('S26 a releases.atom feed that is briefly stale or unreachable passes once it catches up; a persistently stale one fails', () => {
+  let r = run(publish, { ...history(), faults: { atomStaleFor: 2, atomFailFor: 1 } });
+  ok(r);
+  r = run(publish, { ...history(), faults: { atomStale: true } });
+  failed(r, 'post-publish-check');
+  assert.match(r.text, /atom-feed: releases\.atom first entry is v1\.1\.0, expected v1\.2\.0 \(after 4 attempts\)/);
+  assert.equal(latest(r), 'v1.1.0');
+});
+
 test(`S22 approval gate for this channel (${CH})`, () => {
   if (config.approvalEnvironment) {
     failed(run(publish, { ...history(), env: null }), 'gate-unverifiable');

@@ -77,9 +77,11 @@ if (a[0] === 'api') {
   } else if (flags.includes('--latest')) {
     if (fires('setLatest', faults.setLatestFails)) die('gh: HTTP 422: Validation Failed');
     if (!faults.setLatestNoop) st.latest = tag;
+    if (faults.setLatestErrorAfter) die('gh: HTTP 502: Bad Gateway (after the change was applied)');
   } else if (flags.includes('--prerelease')) {
     if (fires('setPrerelease', faults.setPrereleaseFails)) die('gh: HTTP 422: Validation Failed');
     r.prerelease = true; recomputeLatest();
+    if (faults.setPrereleaseErrorAfter) die('gh: HTTP 502: Bad Gateway (after the change was applied)');
   } else die('fake gh: unhandled edit ' + flags.join(' '), 2);
   save();
 } else if (a[0] === 'release' && a[1] === 'delete') {
