@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Release manager for one HYPE TOOLS release-only repository.
 // Usage: node release-tool.mjs <verify|publish|retention|gate-check> --tag vX.Y.Z [--dry-run]
-// Needs only: node, the gh CLI, and the job's GITHUB_TOKEN (as GH_TOKEN). No third-party packages.
+// Needs only: node, the gh CLI, 7z (7-Zip, for installer inspection) and the job's GITHUB_TOKEN (as GH_TOKEN).
+// No third-party packages.
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -11,6 +12,7 @@ import {
   ReleaseError, fail, validateConfig, versionFromTag, checkAssetAllowlist, parseUpdateYml, checkMetadata,
   verifyStatement, validateLedger, lastPublished, planRetention, semverCmp,
 } from './lib.mjs';
+import { inspectInstaller } from './installer-inspection.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const readJson = f => JSON.parse(fs.readFileSync(path.join(ROOT, f), 'utf8'));
@@ -79,6 +81,9 @@ async function verifyDraft(ctx) {
   }
   const yml = parseUpdateYml(fs.readFileSync(path.join(dir, exp.metadata), 'utf8'));
   checkMetadata(config, version, exp, yml, facts[exp.installer]);
+  // Open the installer that was just hashed: its packaged identity must match this channel and version, and an updater
+  // test-fixture build is refused whatever the file is called.
+  const inspected = inspectInstaller(path.join(dir, exp.installer), config, version, { expectedSha512: facts[exp.installer].sha512 });
   const keyFile = path.join(ROOT, config.publicKeyFile);
   const publicKey = fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : '';
   const last = lastPublished(ledger);
@@ -86,7 +91,7 @@ async function verifyDraft(ctx) {
   if (semverCmp(version, last.version) <= 0) fail('version-not-newer', `${version} is not newer than the last published ${last.version}`);
   fs.rmSync(dir, { recursive: true, force: true });
   const snapshot = rel.assets.map(a => ({ id: a.id, name: a.name, size: a.size, updated_at: a.updated_at })).sort((x, y) => x.id - y.id);
-  note(`verified draft ${tag}: ${rel.assets.length} allowlisted assets, installer ${facts[exp.installer].size} bytes, statement sequence ${stmt.sequence}`);
+  note(`verified draft ${tag}: ${rel.assets.length} allowlisted assets, installer ${facts[exp.installer].size} bytes (packaged ${inspected.name} ${inspected.version}, not a test build), statement sequence ${stmt.sequence}`);
   return { release: rel, snapshot, statement: stmt, installerSha512: facts[exp.installer].sha512, exp };
 }
 

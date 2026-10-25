@@ -13,7 +13,7 @@ Release notes, installers, update metadata, hashes, workflow files and the relea
 
 ## How releases are published
 1. The release manager creates a **draft** release and uploads exactly three files: the installer `HYPE-TOOLS-LIVE-Setup-<version>.exe`, `latest.yml` and `release-statement.json`.
-2. The `verify-and-publish` workflow checks the draft (file allowlist, sizes, hashes, metadata, Ed25519 signature, replay protection) and, when asked, publishes it as the latest release.
+2. The `verify-and-publish` workflow checks the draft (file allowlist, sizes, hashes, metadata, Ed25519 signature, replay protection) and, when asked, publishes it as the latest release. It also opens the installer itself with 7-Zip and reads the packaged app: the app name, channel and version must match this repository and the tag, and an updater test build is refused even if it was renamed. If the installer cannot be inspected, nothing is published.
 3. Releases are immutable once published. A bad release is fixed with a new, higher version, never replaced.
 4. Every LIVE publication needs the repository owner's explicit approval: the publish job runs in the `live-release` environment, which requires an owner review before it starts.
 
