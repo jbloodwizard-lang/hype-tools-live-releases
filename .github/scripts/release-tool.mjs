@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ReleaseError, fail, validateConfig, versionFromTag, checkAssetAllowlist, parseUpdateYml, checkMetadata,
-  verifyStatement, validateLedger, lastPublished, planRetention, semverCmp, unrecordedReleases, previousGood,
+  verifyStatement, validateLedger, lastPublished, planRetention, semverCmp, unrecordedReleases, previousGood, ledgerEntryState,
   verifyPublication, recoverLatest, failureEntry, incidentReport, redact, MAX_SMALL_FILE_BYTES,
 } from './lib.mjs';
 import { inspectInstaller } from './installer-inspection.mjs';
@@ -156,25 +156,63 @@ function readLedger(repo) {
   const cur = ghJson(['api', `repos/${repo}/contents/ledger/releases.json`]);
   return { sha: cur.sha, ledger: validateLedger(JSON.parse(Buffer.from(cur.content, 'base64').toString('utf8'))) };
 }
+// Used by retention for idempotent status changes. Each attempt re-reads the ledger; if the change is already there (for
+// example a write that GitHub committed but answered with an error), nothing is written again.
 function putLedger(repo, mutate) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const { sha, ledger } = readLedger(repo);
+    const before = JSON.stringify(ledger);
     mutate(ledger);
     validateLedger(ledger);
+    if (JSON.stringify(ledger) === before) return ledger;
     const body = { message: 'Update release ledger', content: Buffer.from(JSON.stringify(ledger, null, 2) + '\n').toString('base64'), sha };
     try { gh(['api', '-X', 'PUT', `repos/${repo}/contents/ledger/releases.json`, '--input', '-'], { input: JSON.stringify(body) }); return ledger; }
     catch (e) { if (attempt === 2) throw e; }
   }
 }
-// Adds one new ledger entry and reads the ledger back to confirm it landed. Never throws: returns null when the entry is
-// confirmed, otherwise a short error so the caller can say plainly that nothing was durably recorded.
+// Adds one new ledger entry and confirms it from the ledger itself. Before every write and after every write error, the
+// current ledger is read and compared with the whole intended entry (ledgerEntryState), so a write that GitHub committed
+// but answered with an error is confirmed instead of repeated, and an entry is never duplicated or overwritten. At most 3
+// writes, each after a fresh read (as before). Never throws: returns null when the exact entry is confirmed, otherwise
+// { kind: 'missing' | 'conflict' | 'unconfirmed', text } so the caller can say plainly what is and is not recorded.
 function recordLedger(repo, entry) {
-  try {
-    putLedger(repo, l => { if (l.releases.some(r => r.tag === entry.tag)) fail('tag-reused', `${entry.tag} is already in the ledger`); l.releases.push(entry); });
-    const back = readLedger(repo).ledger.releases.find(r => r.tag === entry.tag);
-    if (!back || back.status !== entry.status) return `ledger read-back shows ${back ? back.status : 'no entry'} for ${entry.tag}, expected ${entry.status}`;
+  const errors = [];
+  const confirmed = () => {
+    if (errors.length) note(`ledger write for ${entry.tag}: the write command reported an error (${errors.join('; ')}), but the read-back shows the exact intended entry`);
     return null;
-  } catch (e) { return `ledger write for ${entry.tag} failed: ${ghErr(e)}`; }
+  };
+  const conflict = s => ({ kind: 'conflict', text: `the ledger already has a different entry for ${entry.tag} (differs in: ${s.differs.join(', ')})${errors.length ? `; the write command had reported: ${errors.at(-1)}` : ''}` });
+  const reconcile = () => {
+    try { return ledgerEntryState(readLedger(repo).ledger, entry); }
+    catch (e) { return { state: 'unreadable', error: ghErr(e) }; }
+  };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let cur;
+    try { cur = readLedger(repo); }
+    catch (e) {
+      const text = `ledger for ${entry.tag} could not be read (${ghErr(e)})`;
+      return errors.length ? { kind: 'unconfirmed', text: `the write for ${entry.tag} could not be confirmed: the command reported ${errors.at(-1)} and the ${text}` } : { kind: 'missing', text };
+    }
+    const s = ledgerEntryState(cur.ledger, entry);
+    if (s.state === 'match') return confirmed();
+    if (s.state === 'conflict') return conflict(s);
+    const next = { ...cur.ledger, releases: [...cur.ledger.releases, entry] };
+    try { validateLedger(next); } catch (e) { return { kind: 'missing', text: `ledger entry for ${entry.tag} is invalid: ${e.message}` }; }
+    const body = { message: 'Update release ledger', content: Buffer.from(JSON.stringify(next, null, 2) + '\n').toString('base64'), sha: cur.sha };
+    try { gh(['api', '-X', 'PUT', `repos/${repo}/contents/ledger/releases.json`, '--input', '-'], { input: JSON.stringify(body) }); }
+    catch (e) { errors.push(ghErr(e)); continue; } // the next round reads the ledger first: the write may have been committed
+    const back = reconcile();
+    if (back.state === 'match') return confirmed();
+    if (back.state === 'conflict') return conflict(back);
+    if (back.state === 'unreadable') return { kind: 'unconfirmed', text: `the write for ${entry.tag} was accepted but could not be confirmed: the ledger read-back failed (${back.error})` };
+    return { kind: 'missing', text: `ledger read-back shows no entry for ${entry.tag}, expected ${entry.status}` };
+  }
+  // Every write reported an error: one last read decides whether any of them was committed.
+  const last = reconcile();
+  if (last.state === 'match') return confirmed();
+  if (last.state === 'conflict') return conflict(last);
+  if (last.state === 'unreadable') return { kind: 'unconfirmed', text: `the write for ${entry.tag} could not be confirmed: the command reported ${errors.at(-1)} and the ledger read-back failed (${last.error})` };
+  return { kind: 'missing', text: `ledger write for ${entry.tag} failed: ${errors.at(-1)}` };
 }
 
 async function publish(ctx) {
@@ -209,7 +247,12 @@ async function publish(ctx) {
   if (!problems.length) {
     const ledgerError = recordLedger(repo, { tag, version, sequence: v.statement.sequence, status: 'published', publishedAt: result.published.publishedAt, installerSha512: v.installer.sha512 });
     note(`post-publish checks passed: draft cleared, prerelease ${config.prerelease}, immutable, latest is ${tag}, asset set unchanged, all three assets downloaded publicly and matched size and sha256 (GitHub digest compared for ${result.digests}), installer size and sha512 matched latest.yml and the signed statement, releases.atom`);
-    if (ledgerError) fail('ledger-write', `${ledgerError}. ${tag} is public and verified but NOT recorded; add a published entry for it to ledger/releases.json by hand. Retention was not run`);
+    if (ledgerError) {
+      const fix = { conflict: `correct the existing entry for ${tag} in ledger/releases.json by hand so it records this published release; do not add a second entry`,
+        unconfirmed: `open ledger/releases.json: if it has no entry for ${tag}, add a published entry for it; if it has one that differs, correct it; never add a second entry`,
+        missing: `add a published entry for it to ledger/releases.json by hand` }[ledgerError.kind];
+      fail('ledger-write', `${ledgerError.text}. ${tag} is public and verified but NOT recorded${ledgerError.kind === 'unconfirmed' ? ' as far as this run can confirm' : ''}; ${fix}. Retention was not run`);
+    }
     note(`ledger updated for ${tag} (published, read back)`);
     await retention(ctx);
     return;

@@ -379,6 +379,19 @@ export async function recoverLatest({ io, config, tag, previous }) {
   return { outcome: 'withdraw-unverified', target: null, detail: checks.join('; '), steps, checks };
 }
 
+// Where a ledger stands for one intended entry: 'absent' (no entry for the tag), 'match' (exactly one entry for the tag,
+// equal to the intended entry in every field, nested failure record included) or 'conflict' (anything else; `differs`
+// names the top-level fields that differ). Used to reconcile a write whose result was ambiguous.
+export function ledgerEntryState(ledger, entry) {
+  const canon = v => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).filter(k => v[k] !== undefined).sort().map(k => [k, canon(v[k])])) : Array.isArray(v) ? v.map(canon) : v);
+  const found = ledger.releases.filter(r => r.tag === entry.tag);
+  if (!found.length) return { state: 'absent', differs: [] };
+  if (found.length > 1) return { state: 'conflict', differs: ['duplicate entries'] };
+  const have = canon(found[0]), want = canon(entry);
+  const differs = [...new Set([...Object.keys(have), ...Object.keys(want)])].filter(k => JSON.stringify(have[k]) !== JSON.stringify(want[k])).sort();
+  return differs.length ? { state: 'conflict', differs, entry: found[0] } : { state: 'match', differs: [] };
+}
+
 // The ledger entry for a release whose post-publication verification failed. Small, fixed shape, no secrets.
 export function failureEntry({ tag, version, v, published, problems, recovery, at }) {
   return {
@@ -400,12 +413,18 @@ export function incidentReport({ repo, tag, published, problems, recovery, previ
   else if (r.outcome === 'withdrawn') L.push(`WITHDRAWN FROM LATEST: there is no previous known-good release, so nothing was restored. ${tag} was marked as a prerelease and GitHub now reports no latest release, so clients checking /releases/latest find no update.`);
   else L.push(`RECOVERY NOT CONFIRMED (${r.outcome}): ${r.detail}. Treat ${tag} as possibly still being served as the latest release.`);
   L.push(`STILL PUBLIC: the ${tag} release page, its three assets (direct download links keep working), the ${tag} tag and its releases.atom entry. The release is immutable: its assets cannot be edited, and nothing here deletes or hides it.`);
-  if (ledgerError) L.push(`LEDGER NOT UPDATED: ${ledgerError}. ${tag} is NOT durably recorded as failed-verification. The next verification will refuse to run until the ledger has an entry for ${tag}.`);
+  // ledgerError: null, a string, or { kind: 'missing' | 'conflict' | 'unconfirmed', text } from the ledger write.
+  const le = typeof ledgerError === 'string' ? { kind: 'missing', text: ledgerError } : ledgerError;
+  if (le && le.kind === 'conflict') L.push(`LEDGER CONFLICT: ${le.text}. That entry was left unchanged and no second entry was added, so ${tag} is NOT recorded with this run's failed-verification details.`);
+  else if (le && le.kind === 'unconfirmed') L.push(`LEDGER NOT CONFIRMED: ${le.text}. ${tag} may or may not be recorded as failed-verification. The next verification will refuse to run until the ledger has an entry for ${tag}.`);
+  else if (le) L.push(`LEDGER NOT UPDATED: ${le.text}. ${tag} is NOT durably recorded as failed-verification. The next verification will refuse to run until the ledger has an entry for ${tag}.`);
   else L.push(`LEDGER: ${tag} recorded as failed-verification (recovery: ${r.outcome}) and read back. Its tag, version and sequence can never be reused, and retention will never delete it.`);
   const manual = [];
   if (r.outcome === 'restore-failed' || r.outcome === 'restore-unverified') manual.push(`set the latest release to ${previous.tag} yourself (gh release edit ${previous.tag} --repo ${repo} --latest) and confirm /releases/latest`);
   if (r.outcome === 'withdraw-failed' || r.outcome === 'withdraw-unverified') manual.push(`take ${tag} out of /releases/latest yourself (gh release edit ${tag} --repo ${repo} --prerelease, or delete the release) and confirm /releases/latest`);
-  if (ledgerError) manual.push(`add the failed-verification entry for ${tag} to ledger/releases.json`);
+  if (le && le.kind === 'conflict') manual.push(`correct the existing ledger entry for ${tag} by hand so it records this run's failed-verification (shown above); do not add a second entry`);
+  else if (le && le.kind === 'unconfirmed') manual.push(`open ledger/releases.json: if it has no entry for ${tag}, add the failed-verification entry for ${tag}; if it has one that differs, correct it; never add a second entry`);
+  else if (le) manual.push(`add the failed-verification entry for ${tag} to ledger/releases.json`);
   manual.push(`decide whether to leave ${tag} public or delete it (the tag name stays burned either way), then ship the fix as a new, higher version with a new tag`);
   L.push(`${manual.length > 1 ? 'MANUAL INTERVENTION REQUIRED' : 'NEXT STEP'}: ${manual.join('; then ')}. Retention was not run.`);
   return L;

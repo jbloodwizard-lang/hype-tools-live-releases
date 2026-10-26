@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import {
   validateConfig, versionFromTag, checkAssetAllowlist, parseUpdateYml, checkMetadata, verifyStatement,
   validateLedger, lastPublished, planRetention, semverCmp, ReleaseError, LEDGER_STATUSES, previousGood, unrecordedReleases,
-  verifyPublication, recoverLatest, failureEntry, incidentReport, redact,
+  verifyPublication, recoverLatest, failureEntry, incidentReport, redact, ledgerEntryState,
 } from './lib.mjs';
 
 const live = validateConfig({ schema: 1, channel: 'live', appId: 'com.example.app.live', productName: 'P LIVE', repo: 'o/live', tagPattern: '^v(\\d+\\.\\d+\\.\\d+)$', installerTemplate: 'P-LIVE-Setup-{version}.exe', metadataName: 'latest.yml', statementName: 'release-statement.json', publicKeyFile: 'keys/update-public-key.txt', prerelease: false, retention: 2, approvalEnvironment: 'live-release' });
@@ -354,4 +354,37 @@ test('verifyPublication: a briefly stale or unreachable releases.atom passes onc
   x = world();
   x.w.io.atomFirstTag = async () => { throw new Error('releases.atom HTTP 500'); };
   assert.deepEqual((await verifyPublication(x.args)).problems, ['atom-read: releases.atom HTTP 500 (after 4 attempts)']);
+});
+
+test('ledgerEntryState: the whole intended entry must match; a missing tag is absent; any difference is a conflict', () => {
+  const pub = { tag: 'v1.2.0', version: '1.2.0', sequence: 5, status: 'published', publishedAt: 't', installerSha512: 'h' };
+  const fail = { tag: 'v1.2.0', version: '1.2.0', sequence: 5, status: 'failed-verification', publishedAt: 't', installerSha512: 'h', failure: { at: 'a', checks: ['x: y'], recovery: 'restored', recoveryTarget: 'v1.1.0' } };
+  const L = (...r) => ({ schema: 1, releases: [{ tag: 'v1.1.0', version: '1.1.0', sequence: 4, status: 'published' }, ...r] });
+  assert.equal(ledgerEntryState(L(), pub).state, 'absent');
+  assert.equal(ledgerEntryState(L(pub), pub).state, 'match');
+  assert.equal(ledgerEntryState(L({ ...fail, failure: { ...fail.failure } }), fail).state, 'match');
+  // key order does not matter
+  assert.equal(ledgerEntryState(L(Object.fromEntries(Object.entries(pub).reverse())), pub).state, 'match');
+  for (const [k, v] of [['version', '1.2.1'], ['sequence', 6], ['status', 'failed-verification'], ['installerSha512', 'other'], ['publishedAt', 'u']]) {
+    const s = ledgerEntryState(L({ ...pub, [k]: v }), pub);
+    assert.equal(s.state, 'conflict', k); assert.deepEqual(s.differs, [k]);
+  }
+  for (const f of [{ recovery: 'restore-failed' }, { checks: ['other'] }, { recoveryTarget: null }, { at: 'b' }]) {
+    const s = ledgerEntryState(L({ ...fail, failure: { ...fail.failure, ...f } }), fail);
+    assert.equal(s.state, 'conflict'); assert.deepEqual(s.differs, ['failure']);
+  }
+  assert.deepEqual(ledgerEntryState(L({ ...pub, note: 'extra' }), pub).differs, ['note'], 'an extra field is a difference too');
+  assert.deepEqual(ledgerEntryState(L({ ...pub, failure: undefined, installerSha512: undefined }), pub).differs, ['installerSha512']);
+  assert.equal(ledgerEntryState(L(pub, { ...pub }), pub).state, 'conflict', 'two entries for one tag are never a match');
+});
+
+test('incidentReport: ledger instructions match what is known (missing, conflicting, unconfirmed)', () => {
+  const x = { tag: 'v1.2.0' }, recovery = { outcome: 'restored', target: 'v1.1.0', steps: [], detail: '' };
+  const rep = le => incidentReport({ repo: 'o/live', tag: x.tag, published: null, problems: ['x: y'], recovery, previous: { tag: 'v1.1.0' }, latestBefore: 'v1.1.0', ledgerError: le }).join('\n');
+  assert.match(rep({ kind: 'missing', text: 'HTTP 409' }), /LEDGER NOT UPDATED: HTTP 409[\s\S]*add the failed-verification entry for v1\.2\.0/);
+  const c = rep({ kind: 'conflict', text: 'different entry' });
+  assert.match(c, /LEDGER CONFLICT: different entry/); assert.match(c, /do not add a second entry/); assert.doesNotMatch(c, /add the failed-verification entry for/);
+  const u = rep({ kind: 'unconfirmed', text: 'could not be confirmed' });
+  assert.match(u, /LEDGER NOT CONFIRMED/); assert.match(u, /if it has no entry for v1\.2\.0, add/); assert.match(u, /never add a second entry/);
+  assert.match(rep('HTTP 409'), /LEDGER NOT UPDATED: HTTP 409/, 'a plain string still works');
 });

@@ -258,12 +258,14 @@ test('S11 ledger write fails on the failure path: surfaced, not claimed as recor
   r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 404 }, ledgerPutDropped: true } });
   failed(r, 'post-publish-check');
   assert.match(r.text, /LEDGER NOT UPDATED: ledger read-back shows no entry for v1\.2\.0/);
+  assert.match(r.text, /add the failed-verification entry for v1\.2\.0/);
 });
 
 test('S12 ledger write fails after a healthy publication: failure reported, retention not run', () => {
   const r = run(publish, { ...history(), faults: { ledgerPutFails: true } });
   failed(r, 'ledger-write');
   assert.match(r.text, /v1\.2\.0 is public and verified but NOT recorded/);
+  assert.equal(r.state.ledgerPuts, 3, 'a genuinely failing write is still tried 3 times, each after a fresh read');
   assert.equal(r.state.deleted, undefined);
   assert.equal(latest(r), 'v1.2.0');
 });
@@ -271,7 +273,65 @@ test('S12 ledger write fails after a healthy publication: failure reported, rete
 test('S13 transient ledger conflict is retried and succeeds', () => {
   const r = run(publish, { ...history(), faults: { ledgerPutFails: 1 } });
   ok(r);
+  assert.equal(r.state.ledgerPuts, 3, 'one failed write, one confirmed write, one retention write');
+  assert.equal(r.ledger.filter(x => x.tag === 'v1.2.0').length, 1);
   assert.equal(r.ledger.find(x => x.tag === 'v1.2.0').status, 'published');
+});
+
+// A ledger PUT that GitHub committed but answered with an error must be reconciled from the ledger itself, not retried blindly.
+test('S27 ledger write committed but the command errored (failed-verification): confirmed from the read-back, no second write', () => {
+  const r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 404 }, ledgerPutErrorAfterCommit: true } });
+  failed(r, 'post-publish-check');
+  assert.match(r.result, /ledger updated/);
+  assert.match(r.text, /ledger write for v1\.2\.0: the write command reported an error \(.*502.*\), but the read-back shows the exact intended entry/);
+  assert.match(r.text, /LEDGER: v1\.2\.0 recorded as failed-verification \(recovery: restored\) and read back/);
+  assert.doesNotMatch(r.text, /LEDGER NOT UPDATED|add the failed-verification entry/);
+  assert.equal(r.state.ledgerPuts, 1, 'the committed write is not repeated');
+  const mine = r.ledger.filter(x => x.tag === 'v1.2.0');
+  assert.equal(mine.length, 1, 'never a duplicate entry');
+  assert.equal(mine[0].status, 'failed-verification'); assert.equal(mine[0].sequence, 5); assert.equal(mine[0].failure.recovery, 'restored');
+});
+
+test('S28 ledger write committed but the command errored (healthy publish): published is confirmed, retention runs', () => {
+  const r = run(publish, { ...history(), faults: { ledgerPutErrorAfterCommit: true } });
+  ok(r);
+  assert.match(r.text, /the write command reported an error \(.*502.*\), but the read-back shows the exact intended entry/);
+  assert.match(r.text, /ledger updated for v1\.2\.0 \(published, read back\)/);
+  assert.equal(r.state.ledgerPuts, 2, 'the committed write is not repeated; the second write is retention retiring v1.0.0');
+  const mine = r.ledger.filter(x => x.tag === 'v1.2.0');
+  assert.equal(mine.length, 1); assert.equal(mine[0].status, 'published');
+  assert.deepEqual(r.state.deleted, ['v1.0.0'], 'retention ran because the entry is confirmed');
+  assert.equal(r.ledger.find(x => x.tag === 'v1.0.0').status, 'retired', 'the retention write also committed-then-errored and was confirmed, not repeated');
+});
+
+test('S29 the tag already has a conflicting ledger entry after an ambiguous write: fail closed, never overwritten or duplicated', () => {
+  let r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 404 }, ledgerPutCommitsConflict: true } });
+  failed(r, 'post-publish-check');
+  assert.match(r.result, /ledger NOT updated/);
+  assert.match(r.text, /LEDGER CONFLICT: .*different entry for v1\.2\.0 \(differs in: installerSha512\).*left unchanged/);
+  assert.match(r.text, /correct the existing ledger entry for v1\.2\.0 by hand.*do not add a second entry/);
+  assert.doesNotMatch(r.text, /add the failed-verification entry/);
+  assert.equal(r.state.ledgerPuts, 1, 'a conflicting entry is never overwritten');
+  assert.equal(r.ledger.filter(x => x.tag === 'v1.2.0').length, 1);
+  assert.equal(r.ledger.find(x => x.tag === 'v1.2.0').installerSha512, 'written-by-someone-else');
+  r = run(publish, { ...history(), faults: { ledgerPutCommitsConflict: true } });
+  failed(r, 'ledger-write');
+  assert.match(r.text, /different entry for v1\.2\.0 \(differs in: installerSha512\)/);
+  assert.match(r.text, /correct the existing entry for v1\.2\.0 in ledger\/releases\.json by hand.*do not add a second entry/);
+  assert.equal(r.state.deleted, undefined, 'retention not run');
+});
+
+test('S30 the write cannot be confirmed (the read-back fails after the write): fail closed with check-then-fix instructions', () => {
+  let r = run(publish, { ...history(), faults: { publicStatus: { 'latest.yml': 404 }, ledgerPutErrorAfterCommit: true, ledgerReadFailsAfterPut: true } });
+  failed(r, 'post-publish-check');
+  assert.match(r.result, /ledger NOT updated/);
+  assert.match(r.text, /LEDGER NOT CONFIRMED: .*could not be confirmed.*503/);
+  assert.match(r.text, /open ledger\/releases\.json: if it has no entry for v1\.2\.0, add the failed-verification entry .*; if it has one that differs, correct it; never add a second entry/);
+  assert.equal(r.state.ledgerPuts, 1, 'no further write while the state is unknown');
+  r = run(publish, { ...history(), faults: { ledgerReadFailsAfterPut: true } });
+  failed(r, 'ledger-write');
+  assert.match(r.text, /could not be confirmed/);
+  assert.equal(r.state.deleted, undefined);
 });
 
 test('S14 missing or unreadable GitHub data fails closed with diagnostics instead of crashing', () => {

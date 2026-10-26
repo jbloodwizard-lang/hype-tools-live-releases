@@ -57,9 +57,19 @@ if (a[0] === 'api') {
       if (fires('ledgerPut', faults.ledgerPutFails)) die('gh: HTTP 409: ledger/releases.json does not match sha');
       const body = JSON.parse(fs.readFileSync(0, 'utf8'));
       if (body.sha !== st.ledgerSha) die('gh: HTTP 409: sha mismatch');
-      if (!faults.ledgerPutDropped) { st.ledger = Buffer.from(body.content, 'base64').toString('utf8'); st.ledgerSha = 's' + st.ledgerPuts; }
+      if (!faults.ledgerPutDropped) { st.ledger = Buffer.from(body.content, 'base64').toString('utf8'); st.ledgerSha = 's' + st.ledgerPuts; st.ledgerCommitted = true; }
+      // GitHub committed the write, but a different version of the new entry landed (as if another writer raced it).
+      if (faults.ledgerPutCommitsConflict) {
+        const l = JSON.parse(st.ledger); l.releases.at(-1).installerSha512 = 'written-by-someone-else'; st.ledger = JSON.stringify(l, null, 2) + '\n';
+        die('gh: HTTP 502: Bad Gateway (after the change was applied)');
+      }
+      // GitHub committed the write, but the CLI still received an error.
+      if (fires('ledgerPutErrorAfterCommit', faults.ledgerPutErrorAfterCommit)) die('gh: HTTP 502: Bad Gateway (after the change was applied)');
       save(); out({});
-    } else out({ sha: st.ledgerSha, content: Buffer.from(st.ledger).toString('base64') });
+    } else {
+      if (faults.ledgerReadFailsAfterPut && st.ledgerCommitted) die('gh: HTTP 503: Service Unavailable');
+      out({ sha: st.ledgerSha, content: Buffer.from(st.ledger).toString('base64') });
+    }
   } else if (/^repos\/[^/]+\/[^/]+$/.test(url)) out({ default_branch: 'main' });
   else die('fake gh: unhandled api ' + url, 2);
 } else if (a[0] === 'release' && a[1] === 'edit') {
