@@ -8,6 +8,20 @@ It contains no application source code. The source repository is private.
 - Updates: the LIVE app checks this repository only, when you ask it to. It asks before downloading and again before installing, and verifies a signed release statement and the installer hash.
 - This is the LIVE channel. The BETA channel has its own separate repository and identity.
 
+## Download HYPE TOOLS
+
+**Downloads are not available yet.** The first BETA installer is being prepared. LIVE will follow after the BETA installation and update path have been validated.
+
+| Channel | Current status | Official downloads |
+|---|---|---|
+| **HYPE TOOLS BETA** | Coming soon — first release is being prepared | [Open BETA Releases](https://github.com/jbloodwizard-lang/hype-tools-beta-releases/releases) |
+| **HYPE TOOLS LIVE** | Coming soon — first approved stable release is not yet available | [Open LIVE Releases](https://github.com/jbloodwizard-lang/hype-tools-live-releases/releases) |
+
+When a channel is ready, its installer and release notes will appear on that channel's Releases page above. Choose the `HYPE-TOOLS-BETA-Setup-<version>.exe` or `HYPE-TOOLS-LIVE-Setup-<version>.exe` asset matching the channel you intend to use. **Do not download or install a draft; only use a published release.**
+
+BETA is for testing and may be unstable; LIVE is the approved stable channel. Both release repositories are public. Windows installers are initially unsigned, so Windows may display an unknown-publisher or SmartScreen warning.
+
+
 ## Everything here is public
 Release notes, installers, update metadata, hashes, workflow files and the release ledger are visible to anyone, and copies may be kept elsewhere. Installers contain extractable application code.
 
