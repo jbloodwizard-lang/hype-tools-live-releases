@@ -4,22 +4,9 @@ Public, release-only repository for **HYPE TOOLS LIVE** installers and update me
 It contains no application source code. The source repository is private.
 
 - App identity: `com.hypetools.desktop.live`
-- Download: see the [Releases](../../releases) page. Only the newest two healthy releases are kept by automatic cleanup; releases that failed their post-publication checks are never removed automatically (see below).
+- Distribution: this repository hosts release assets and update metadata consumed by installed HYPE TOOLS LIVE clients. It is not a user-facing download landing page. Only the newest two healthy releases are kept by automatic cleanup; releases that failed their post-publication checks are never removed automatically.
 - Updates: the LIVE app checks this repository only, when you ask it to. It asks before downloading and again before installing, and verifies a signed release statement and the installer hash.
 - This is the LIVE channel. The BETA channel has its own separate repository and identity.
-
-## Download HYPE TOOLS
-
-**Downloads are not available yet.** The first BETA installer is being prepared. LIVE will follow after the BETA installation and update path have been validated.
-
-| Channel | Current status | Official downloads |
-|---|---|---|
-| **HYPE TOOLS BETA** | Coming soon — first release is being prepared | [Open BETA Releases](https://github.com/jbloodwizard-lang/hype-tools-beta-releases/releases) |
-| **HYPE TOOLS LIVE** | Coming soon — first approved stable release is not yet available | [Open LIVE Releases](https://github.com/jbloodwizard-lang/hype-tools-live-releases/releases) |
-
-When a channel is ready, its installer and release notes will appear on that channel's Releases page above. Choose the `HYPE-TOOLS-BETA-Setup-<version>.exe` or `HYPE-TOOLS-LIVE-Setup-<version>.exe` asset matching the channel you intend to use. **Do not download or install a draft; only use a published release.**
-
-BETA is for testing and may be unstable; LIVE is the approved stable channel. Both release repositories are public. Windows installers are initially unsigned, so Windows may display an unknown-publisher or SmartScreen warning.
 
 
 ## Everything here is public
