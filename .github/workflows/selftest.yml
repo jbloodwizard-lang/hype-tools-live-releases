@@ -23,5 +23,7 @@ jobs:
       - run: node .github/scripts/lib.test.mjs
       - name: Installer inspection tests (needs the runner's 7z)
         run: node .github/scripts/installer-inspection.test.mjs
+      - name: Simulated release publication and recovery tests (fake GitHub, offline; needs the runner's 7z)
+        run: node .github/scripts/release-tool.test.mjs
       - name: Config and ledger sanity
         run: node .github/scripts/check-static.mjs
